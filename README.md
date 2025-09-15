@@ -145,6 +145,3 @@ Ventilador 5V acionado automaticamente quando temperatura (DHT22) ultrapassa lim
 - 1x MOSFET IRLZ44N  
 - 1x Sensor DHT22  
 - 1x Resistor 10kΩ (pull-up)  
-
-- Branch separada para cada entrega obrigatória
-
