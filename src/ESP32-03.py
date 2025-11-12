@@ -1,378 +1,322 @@
-# main.py - Smart Home - controle LEDs, PIR, persiana e irrigação via MQTT
-# Baseado no código fornecido pelo usuário. MicroPython (ESP32).
-
 import network
 import time
 from machine import Pin, PWM, ADC
 from umqtt.simple import MQTTClient
 
 # --------------------- CONFIG ---------------------
-SSID = "batcaverna"
-PASSWORD = "eusouobatman"
+SSID = "x"
+SENHA = "xx"
 
-MQTT_BROKER = "76a060ba0e5e4996b1e10d38c3bfde9b.s1.eu.hivemq.cloud"
-MQTT_PORT = 8883
-CLIENT_ID = b"smart_home_esp32"
-MQTT_USER = "speedy"
-MQTT_PASS = "Master123"
+MQTT_SERVIDOR = "x.s1.eu.hivemq.cloud"
+MQTT_PORTA = 8883
+MQTT_CLIENTE_ID = b"casa_inteligente_esp32"
+MQTT_USUARIO = "x"
+MQTT_SENHA = "xxx"
 
-# pinos MOSFET (PWM) -> correspondem aos cômodos abaixo
-MOSFET_PINS = {
-    "garagem": 15,
-    "sala": 13,
-    "cozinha": 14,
-    "quarto": 27,
-    "banheiro": 25,
-    "area_externa": 33,
+# Cômodos e pinos dos MOSFETs
+MOSFET_PINOS = {
+    "jardim": 13,
+    "sala": 12,
+    "garagem": 14,
+    "cozinha": 27,
+    "varanda": 26,
+    "quarto": 25,
+    "banheiro": 15,
 }
+COMODOS = list(MOSFET_PINOS.keys())
 
-ROOMS = list(MOSFET_PINS.keys())
-
-# PIRs (para garagem e area_externa)
-PIR_PINS = {
+# Sensores de presença (PIR)
+PIR_PINOS = {
     "garagem": 34,
-    "area_externa": 35,
 }
+TEMPO_AUTO_PIR = 1 * 60 
 
-PIR_AUTO_DURATION = 3 * 60  # segundos (3 minutos)
+# Sensor de luminosidade (LDR)
+LDR_PINO = 35
+LIMIAR_LDR = 50 
 
-# LDR (VP) - ADC pin. VP tipicamente GPIO36; se for outro, ajuste.
-LDR_PIN = 36
-LDR_THRESHOLD = 2000  # ajustar conforme leitura (0-4095)
+# Irrigação via LED azul (simulação)
+PINO_LED_IRRIGACAO = 21
 
-# Persiana (ponte H)
-BLIND_ENA_PIN = 21  # PWM (velocidade/opcional)
-BLIND_IN1_PIN = 22
-BLIND_IN2_PIN = 23
+TOPICO_PREFIXO = "casa/"
 
-# Irrigação
-IRRIGATION_PIN = 18  # mosfet para bomba
-RESERVOIR_SWITCH_PIN = 5  # float switch (digital input)
+# --------------------- ESTADOS ---------------------
+wifi_conectado = False
+cliente = None
 
-# MQTT topics
-# - ligar/desligar por cômodo: "home/<room>/set" payload "ON"/"OFF"
-# - intensidade por cômodo: "home/<room>/brightness" payload "0"-"100"
-# - controlar todas: "home/all/set" e "home/all/brightness"
-# - persiana auto: "home/blind/auto" payload "ON"/"OFF"
-# - persiana manual: "home/blind/manual" payload "OPEN"/"CLOSE"/"STOP"
-# - irrigação: "home/irrigation/set" payload "ON"/"OFF"
-# - status: assistant publica em "home/<room>/status", "home/irrigation/status", "home/blind/status"
-TOPIC_PREFIX = "home/"
+luzes_pwm = {}
+estado_luzes = {}
+for c in COMODOS:
+    estado_luzes[c] = {"ligado": True, "brilho": 100, "pir_auto": (c in PIR_PINOS)}
 
-# --------------------------------------------------
+ultimo_pir = {c: 0 for c in PIR_PINOS.keys()}
+PWM_FREQUENCIA = 1000
 
-# estado interno
-wifi_connected = False
-client = None
+# Variáveis LDR
+ultimo_status_ldr = None
+INTERVALO_LDR = 5
+ultimo_debug_ldr = 0
 
-# PWM objects for lights
-lights_pwm = {}
-lights_state = {}        # {"room": {"on": bool, "brightness": 0-100, "pir_auto_enabled": bool}}
-for r in ROOMS:
-    lights_state[r] = {"on": False, "brightness": 100, "pir_auto_enabled": (r in PIR_PINS)}
+# Objetos de hardware globais
+led_irrigacao = None
+adc_ldr = None
 
-# PIR state: tracks last trigger time
-pir_last_trigger = {r: 0 for r in PIR_PINS.keys()}
+# --------------------- INICIALIZAÇÃO ---------------------
+def iniciar_hardware():
+    global luzes_pwm, adc_ldr, led_irrigacao
 
-# PWM frequency for LEDs (ajuste se necessário)
-PWM_FREQ = 1000  # Hz
+    print("Iniciando hardware...")
 
-# Inicializa hardware
-def hw_init():
-    global lights_pwm, adc_ldr, blind_ena_pwm, blind_in1, blind_in2
-    # criar PWMs para MOSFETs
-    for room, pin_no in MOSFET_PINS.items():
-        p = PWM(Pin(pin_no), freq=PWM_FREQ)
-        p.duty_u16(0)
-        lights_pwm[room] = p
+    # LEDs (MOSFETs)
+    for comodo, pino in MOSFET_PINOS.items():
+        pwm = PWM(Pin(pino), freq=PWM_FREQUENCIA)
+        pwm.duty_u16(65535)
+        luzes_pwm[comodo] = pwm
+        print(f"LED {comodo}: GPIO {pino}")
 
     # PIRs
-    for room, pin_no in PIR_PINS.items():
-        Pin(pin_no, Pin.IN)
+    for comodo, pino in PIR_PINOS.items():
+        Pin(pino, Pin.IN)
+        print(f"PIR {comodo}: GPIO {pino}")
 
-    # ADC LDR
-    adc_ldr = ADC(Pin(LDR_PIN))
+    # LDR
+    adc_ldr = ADC(Pin(LDR_PINO))
     adc_ldr.atten(ADC.ATTN_11DB)
-    # ADC width default 12 bits (0-4095)
+    adc_ldr.width(ADC.WIDTH_12BIT)
+    print(f"LDR: GPIO {LDR_PINO}")
 
-    # Persiana (ponte H)
-    blind_ena_pwm = PWM(Pin(BLIND_ENA_PIN), freq=1000)
-    blind_ena_pwm.duty_u16(0)
-    blind_in1 = Pin(BLIND_IN1_PIN, Pin.OUT)
-    blind_in2 = Pin(BLIND_IN2_PIN, Pin.OUT)
+    # Irrigação via LED
+    led_irrigacao = Pin(PINO_LED_IRRIGACAO, Pin.OUT)
+    led_irrigacao.value(0)
+    print(f"Irrigação (LED azul): GPIO {PINO_LED_IRRIGACAO}")
 
-    # Irrigação
-    Pin(IRRIGATION_PIN, Pin.OUT, value=0)
+    print("Hardware inicializado!")
 
-    # Reservatório
-    Pin(RESERVOIR_SWITCH_PIN, Pin.IN)
+# --------------------- LDR ---------------------
+def ler_ldr():
+    try:
+        valor = adc_ldr.read()
+        return valor
+    except Exception as e:
+        print("Erro lendo LDR:", e)
+        return None
 
-# ----------------- WiFi e MQTT -----------------
+def classificar_ldr(valor):
+    if valor is None:
+        return "ERRO"
+    if valor < LIMIAR_LDR:
+        return "NOITE"
+    else:
+        return "DIA"
+
+def publicar_status_ldr():
+    global ultimo_status_ldr, ultimo_debug_ldr
+    valor = ler_ldr()
+    if valor is None:
+        return
+
+    status_atual = classificar_ldr(valor)
+
+    agora = time.time()
+    if agora - ultimo_debug_ldr > 10:
+        print(f"LDR Debug: valor={valor}, status={status_atual}, limite={LIMIAR_LDR}")
+        ultimo_debug_ldr = agora
+
+    if status_atual != ultimo_status_ldr and status_atual != "ERRO":
+        try:
+            cliente.publish(b"casa/ldr/status", status_atual.encode())
+            print(f"LDR: {valor} -> {status_atual} (Publicado)")
+            ultimo_status_ldr = status_atual
+        except Exception as e:
+            print("Erro publicando LDR:", e)
+
+# Controle automático do jardim baseado no LDR
+def tratar_ldr_jardim():
+    valor = ler_ldr()
+    if valor is None:
+        return
+    status = classificar_ldr(valor)
+    if status == "NOITE" and not estado_luzes["jardim"]["ligado"]:
+        print(f"LDR: {valor} -> NOITE -> Ligando luz do jardim")
+        ligar_comodo("jardim", True)
+    elif status == "DIA" and estado_luzes["jardim"]["ligado"]:
+        print(f"LDR: {valor} -> DIA -> Desligando luz do jardim")
+        ligar_comodo("jardim", False)
+
+# --------------------- WIFI E MQTT ---------------------
 def conectar_wifi():
-    global wifi_connected
+    global wifi_conectado
     wlan = network.WLAN(network.STA_IF)
     wlan.active(True)
     if not wlan.isconnected():
-        wlan.connect(SSID, PASSWORD)
+        print("Conectando WiFi...")
+        wlan.connect(SSID, SENHA)
         t0 = time.time()
         while not wlan.isconnected():
             time.sleep(0.5)
-            # timeout opcional
             if time.time() - t0 > 15:
                 break
-    wifi_connected = wlan.isconnected()
-    if wifi_connected:
-        print("WiFi conectado:", wlan.ifconfig())
-    else:
-        print("Falha ao conectar WiFi")
+    wifi_conectado = wlan.isconnected()
+    print("Wi-Fi conectado:", wlan.ifconfig() if wifi_conectado else "Falha na conexão")
 
-def mqtt_connect():
-    global client
-    client = MQTTClient(
-        CLIENT_ID, MQTT_BROKER, port=MQTT_PORT,
-        user=MQTT_USER, password=MQTT_PASS,
-        ssl=True, ssl_params={"server_hostname": MQTT_BROKER}
+def conectar_mqtt():
+    global cliente
+    cliente = MQTTClient(
+        MQTT_CLIENTE_ID,
+        MQTT_SERVIDOR,
+        port=MQTT_PORTA,
+        user=MQTT_USUARIO,
+        password=MQTT_SENHA,
+        ssl=True,
+        ssl_params={"server_hostname": MQTT_SERVIDOR}
     )
-    client.set_callback(mqtt_callback)
-    client.connect()
-    # subscribes
-    client.subscribe(b"home/+/set")
-    client.subscribe(b"home/+/brightness")
-    client.subscribe(b"home/all/set")
-    client.subscribe(b"home/all/brightness")
-    client.subscribe(b"home/blind/auto")
-    client.subscribe(b"home/blind/manual")
-    client.subscribe(b"home/irrigation/set")
-    print("MQTT conectado e inscrito nos tópicos.")
+    cliente.set_callback(receber_mqtt)
+    cliente.connect()
 
-# ----------------- utilidades luzes -----------------
-def brightness_to_duty16(b):
-    # b: 0-100 -> duty_u16 0-65535
-    if b <= 0:
-        return 0
-    if b >= 100:
-        return 65535
+    # Inscrever nos tópicos
+    cliente.subscribe(b"casa/+/ligar")
+    cliente.subscribe(b"casa/+/brilho")
+    cliente.subscribe(b"casa/todos/ligar")
+    cliente.subscribe(b"casa/todos/brilho")
+    cliente.subscribe(b"casa/irrigacao/ligar")
+    print("MQTT conectado e inscrito.")
+
+# --------------------- FUNÇÕES DAS LUZES ---------------------
+def brilho_para_duty(b):
+    b = max(0, min(100, int(b)))
     return int(b * 65535 / 100)
 
-def set_room_brightness(room, brightness):
-    brightness = max(0, min(100, int(brightness)))
-    lights_state[room]["brightness"] = brightness
-    if lights_state[room]["on"]:
-        lights_pwm[room].duty_u16(brightness_to_duty16(brightness))
+def definir_brilho(comodo, brilho):
+    estado_luzes[comodo]["brilho"] = brilho
+    if estado_luzes[comodo]["ligado"]:
+        luzes_pwm[comodo].duty_u16(brilho_para_duty(brilho))
     else:
-        lights_pwm[room].duty_u16(0)
-    publish_state(room)
+        luzes_pwm[comodo].duty_u16(0)
+    publicar_estado(comodo)
 
-def set_room_onoff(room, on):
-    lights_state[room]["on"] = bool(on)
-    if lights_state[room]["on"]:
-        lights_pwm[room].duty_u16(brightness_to_duty16(lights_state[room]["brightness"]))
+def ligar_comodo(comodo, ligado):
+    estado_luzes[comodo]["ligado"] = bool(ligado)
+    if ligado:
+        luzes_pwm[comodo].duty_u16(brilho_para_duty(estado_luzes[comodo]["brilho"]))
     else:
-        lights_pwm[room].duty_u16(0)
-    publish_state(room)
+        luzes_pwm[comodo].duty_u16(0)
+    publicar_estado(comodo)
 
-def set_all_brightness(brightness):
-    for r in ROOMS:
-        set_room_brightness(r, brightness)
+def definir_brilho_todos(brilho):
+    for c in COMODOS:
+        definir_brilho(c, brilho)
 
-def set_all_onoff(on):
-    for r in ROOMS:
-        set_room_onoff(r, on)
+def ligar_todos(ligado):
+    for c in COMODOS:
+        ligar_comodo(c, ligado)
 
-def publish_state(room):
+def publicar_estado(comodo):
     try:
-        topic = (TOPIC_PREFIX + room + "/status").encode()
-        payload = ("ON" if lights_state[room]["on"] else "OFF") + ",BRIGHT=" + str(lights_state[room]["brightness"])
-        client.publish(topic, payload)
+        topico = (TOPICO_PREFIXO + comodo + "/status").encode()
+        payload = ("ON" if estado_luzes[comodo]["ligado"] else "OFF") + ",BRILHO=" + str(estado_luzes[comodo]["brilho"])
+        cliente.publish(topico, payload)
     except Exception as e:
-        print("Erro publish_state:", e)
+        print("Erro publicando estado:", e)
 
-# ----------------- PIR handling -----------------
-def handle_pir():
-    now = time.time()
-    for room, pin_no in PIR_PINS.items():
-        pin = Pin(pin_no, Pin.IN)
-        if pin.value() == 1:
-            # trigger
-            pir_last_trigger[room] = now
-            # se PIR auto habilitado liga a luz por PIR_AUTO_DURATION
-            if lights_state.get(room, {}).get("pir_auto_enabled", False):
-                print("PIR detectado em", room)
-                # liga na intensidade setada
-                set_room_onoff(room, True)
-        # se já houve trigger e tempo expirou, desligar se não foi ligado manualmente
-        if pir_last_trigger[room] != 0 and (now - pir_last_trigger[room]) > PIR_AUTO_DURATION:
-            # somente desliga se estado foi ligado por PIR (não distinguimos origem aqui,
-            # então desliga somente se atualmente ON e pir_auto_enabled)
-            if lights_state[room]["on"] and lights_state[room]["pir_auto_enabled"]:
-                print("PIR auto duration ended -> desligando", room)
-                set_room_onoff(room, False)
-            pir_last_trigger[room] = 0
+# --------------------- PIR ---------------------
+def tratar_pir():
+    agora = time.time()
+    for comodo, pino in PIR_PINOS.items():
+        sensor = Pin(pino, Pin.IN)
+        if sensor.value() == 1:
+            ultimo_pir[comodo] = agora
+            if estado_luzes[comodo]["pir_auto"]:
+                ligar_comodo(comodo, True)
+        if ultimo_pir[comodo] != 0 and (agora - ultimo_pir[comodo]) > TEMPO_AUTO_PIR:
+            if estado_luzes[comodo]["ligado"] and estado_luzes[comodo]["pir_auto"]:
+                ligar_comodo(comodo, False)
+            ultimo_pir[comodo] = 0
 
-# ----------------- LDR + persiana -----------------
-blind_auto_enabled = True
+# --------------------- IRRIGAÇÃO (LED) ---------------------
+def definir_irrigacao(ligado):
+    led_irrigacao.value(1 if ligado else 0)
+    cliente.publish(b"casa/irrigacao/status", b"ON" if ligado else b"OFF")
 
-def read_ldr():
+# --------------------- CALLBACK MQTT ---------------------
+def receber_mqtt(topico, msg):
     try:
-        return adc_ldr.read()  # 0-4095
-    except:
-        return None
-
-def blind_open():
-    print("Persiana: ABRIR")
-    blind_in1.value(1)
-    blind_in2.value(0)
-    blind_ena_pwm.duty_u16(40000)  # velocidade - ajuste
-    client.publish(b"home/blind/status", b"OPEN")
-
-def blind_close():
-    print("Persiana: FECHAR")
-    blind_in1.value(0)
-    blind_in2.value(1)
-    blind_ena_pwm.duty_u16(40000)
-    client.publish(b"home/blind/status", b"CLOSED")
-
-def blind_stop():
-    print("Persiana: STOP")
-    blind_in1.value(0)
-    blind_in2.value(0)
-    blind_ena_pwm.duty_u16(0)
-    client.publish(b"home/blind/status", b"STOPPED")
-
-# Lógica: assumimos que se LDR indicar claro (valor baixo ou alto depende do LDR + pull),
-# você pode ajustar LDR_THRESHOLD e a direção abaixo. A maioria dos LDR+divider
-# retorna valores maiores com mais luz. Ajuste se necessário.
-def handle_ldr_and_blind():
-    if not blind_auto_enabled:
-        return
-    val = read_ldr()
-    if val is None:
-        return
-    # se claro -> abrir persiana; se escuro -> fechar
-    if val > LDR_THRESHOLD:
-        # muito claro
-        blind_open()
-    else:
-        blind_close()
-
-# ----------------- Irrigação -----------------
-def irrigation_set(on):
-    Pin(IRRIGATION_PIN, Pin.OUT).value(1 if on else 0)
-    client.publish(b"home/irrigation/status", b"ON" if on else b"OFF")
-
-def reservoir_ok():
-    # float switch: ajustar lógica (0 ou 1 dependendo do seu sensor)
-    s = Pin(RESERVOIR_SWITCH_PIN, Pin.IN).value()
-    # assumimos: 1 = água presente; 0 = vazio -> ajuste conforme seu hardware
-    return bool(s)
-
-# ----------------- MQTT callback -----------------
-def mqtt_callback(topic, msg):
-    try:
-        topic = topic.decode()
+        topico = topico.decode()
         msg = msg.decode().strip()
-        print("MQTT <-", topic, msg)
-        # tratar tópicos home/<room>/set e /brightness
-        parts = topic.split('/')
-        if len(parts) >= 3 and parts[0] == "home":
-            if parts[1] == "all":
-                # home/all/set ou home/all/brightness
-                if parts[2] == "set":
-                    if msg.upper() in ("ON", "1"):
-                        set_all_onoff(True)
-                    elif msg.upper() in ("OFF", "0"):
-                        set_all_onoff(False)
-                elif parts[2] == "brightness":
-                    try:
-                        b = int(msg)
-                        set_all_brightness(b)
-                    except:
-                        print("brightness inválido:", msg)
-                return
-            if parts[1] == "blind":
-                if parts[2] == "auto":
-                    global blind_auto_enabled
-                    blind_auto_enabled = (msg.upper() in ("ON", "1"))
-                    client.publish(b"home/blind/status", b"AUTO_ON" if blind_auto_enabled else b"AUTO_OFF")
-                    return
-                if parts[2] == "manual":
-                    cmd = msg.upper()
-                    if cmd == "OPEN":
-                        blind_open()
-                    elif cmd == "CLOSE":
-                        blind_close()
-                    elif cmd == "STOP":
-                        blind_stop()
-                    return
-            if parts[1] == "irrigation":
-                if parts[2] == "set":
-                    if msg.upper() in ("ON", "1"):
-                        irrigation_set(True)
-                    elif msg.upper() in ("OFF", "0"):
-                        irrigation_set(False)
-                    return
-            # caso normal: home/<room>/set ou home/<room>/brightness
-            room = parts[1]
-            if room in ROOMS:
-                if parts[2] == "set":
-                    if msg.upper() in ("ON", "1"):
-                        set_room_onoff(room, True)
-                    elif msg.upper() in ("OFF", "0"):
-                        set_room_onoff(room, False)
-                elif parts[2] == "brightness":
-                    try:
-                        b = int(msg)
-                        set_room_brightness(room, b)
-                    except:
-                        print("brightness inválido:", msg)
-                return
-    except Exception as e:
-        print("Erro no mqtt_callback:", e)
+        print("MQTT <-", topico, msg)
+        partes = topico.split('/')
+        if len(partes) < 3:
+            return
 
-# ----------------- Main loop -----------------
+        if partes[1] == "todos":
+            if partes[2] == "ligar":
+                ligar_todos(msg.upper() in ("ON", "1"))
+            elif partes[2] == "brilho":
+                try:
+                    definir_brilho_todos(int(msg))
+                except:
+                    pass
+            return
+
+        if partes[1] == "irrigacao":
+            if partes[2] == "ligar":
+                definir_irrigacao(msg.upper() in ("ON", "1"))
+                return
+
+        comodo = partes[1]
+        if comodo in COMODOS:
+            if partes[2] == "ligar":
+                ligar_comodo(comodo, msg.upper() in ("ON", "1"))
+            elif partes[2] == "brilho":
+                try:
+                    definir_brilho(comodo, int(msg))
+                except:
+                    pass
+
+    except Exception as e:
+        print("Erro callback MQTT:", e)
+
+# --------------------- LOOP PRINCIPAL ---------------------
 def main():
-    hw_init()
+    iniciar_hardware()
     conectar_wifi()
     try:
-        mqtt_connect()
+        conectar_mqtt()
     except Exception as e:
-        print("Erro ao conectar MQTT:", e)
-        # tenta conectar sem SSL (fallback) ou reiniciar - não implementado automaticamente aqui
+        print("Erro MQTT:", e)
 
-    last_ldr_check = 0
-    last_pir_check = 0
-    last_reservoir_publish = 0
+    ultimo_pir_check = 0
+    ultimo_ldr_check = 0
+    ultimo_ldr_publicacao = 0
+
+    print("Sistema iniciado! Monitorando LDR...")
 
     while True:
-        # checar mensagens MQTT (não bloqueante)
         try:
-            client.check_msg()
+            cliente.check_msg()
         except Exception as e:
-            # tentar reconectar se der problema
-            print("MQTT check_msg erro:", e)
+            print("Erro MQTT:", e)
             try:
-                mqtt_connect()
-            except Exception as e2:
-                print("Falha reconectar MQTT:", e2)
+                conectar_mqtt()
+            except:
+                pass
             time.sleep(1)
 
-        # PIR: checar frequentemente
-        if time.time() - last_pir_check > 0.5:
-            handle_pir()
-            last_pir_check = time.time()
+        agora = time.time()
 
-        # LDR e persiana: checar a cada 2s (ajustável)
-        if time.time() - last_ldr_check > 2:
-            handle_ldr_and_blind()
-            last_ldr_check = time.time()
+        if agora - ultimo_pir_check > 0.5:
+            tratar_pir()
+            ultimo_pir_check = agora
 
-        # publicar estado do reservatório periodicamente
-        if time.time() - last_reservoir_publish > 10:
-            ok = reservoir_ok()
-            client.publish(b"home/irrigation/reservoir", b"OK" if ok else b"EMPTY")
-            last_reservoir_publish = time.time()
+        if agora - ultimo_ldr_check > 5:
+            tratar_ldr_jardim()
+            ultimo_ldr_check = agora
+
+        if agora - ultimo_ldr_publicacao > INTERVALO_LDR:
+            publicar_status_ldr()
+            ultimo_ldr_publicacao = agora
 
         time.sleep(0.1)
 
 if __name__ == "__main__":
     main()
+
