@@ -3,7 +3,7 @@ import time
 from machine import Pin, ADC, PWM, I2C
 import ssd1306
 from umqtt.simple import MQTTClient
-import dht 
+import dht
 
 # --- Buzzer do timer ---
 buzzer_timer = PWM(Pin(15))
@@ -11,7 +11,7 @@ buzzer_timer.freq(2000)
 buzzer_timer.duty_u16(0)
 
 # --- Buzzer de alarme ---
-buzzer = PWM(Pin(27))
+buzzer = PWM(Pin(14))
 buzzer.duty_u16(0)
 
 # --- Config Wi-Fi ---
@@ -19,56 +19,57 @@ SSID = "batcaverna"
 PASSWORD = "eusouobatman"
 
 # --- Config MQTT HiveMQ Cloud ---
-MQTT_BROKER = "numeroaqui.s1.eu.hivemq.cloud" #o endereço do broker está correto no codigo do ESP32, foi retirado do github o endereço real por motivos de segurança
+MQTT_BROKER = "76a060ba0e5e4996b1e10d38c3bfde9b.s1.eu.hivemq.cloud"
 MQTT_PORT = 8883
-CLIENT_ID = "smart_home"
+CLIENT_ID = "smart_home_1"
 MQTT_USER = "speedy"
-MQTT_PASS = "teste"
+MQTT_PASS = "Master123"
 
-# --- Config do mosfet ---
+# --- Config do relé ---
 rele_ventilador = Pin(5, Pin.OUT)
 rele_ventilador.value(0)
 
-override_ventilador = None 
+# --- Override do ventilador ---
+override_ventilador = None  # None = automático, True = ligado manual, False = desligado manual
 
 # --- LEDs ---
 leds = {
-    "gas": Pin(25, Pin.OUT),
+    "gas": Pin(27, Pin.OUT),
     "fumaca": Pin(26, Pin.OUT),
 }
 
 # --- MQ-2 ---
 mq2 = ADC(Pin(34))
 mq2.atten(ADC.ATTN_11DB)
-limiarGas = 1500
-limiarFumaca = 2500
+limiarGas = 2000
+limiarFumaca = 1500
 
 # --- DHT22 ---
-dht22 = dht.DHT22(Pin(23))
+dht22 = dht.DHT22(Pin(33))
 
 # --- DHT11 ---
-dht11 = dht.DHT11(Pin(13))
+dht11 = dht.DHT11(Pin(32))
 
 # --- Estados ---
 estado_leds = {nome: False for nome in leds}
 manual_override = {nome: False for nome in leds}
 alarme_ativo = None
 alarme_start = 0
-ALARME_MIN_MS = 3000
+ALARME_MIN_MS = 5000
 client = None
 
 # --- OLED ---
-i2c = I2C(0, scl=Pin(21), sda=Pin(22))
+i2c = I2C(0, scl=Pin(22), sda=Pin(23))
 oled = ssd1306.SSD1306_I2C(128, 64, i2c)
 
 # --- Keypad ---
-ROWS = [Pin(32, Pin.OUT), Pin(33, Pin.OUT), Pin(19, Pin.OUT), Pin(18, Pin.OUT)]
-COLS = [Pin(4, Pin.IN, Pin.PULL_DOWN), Pin(14, Pin.IN, Pin.PULL_DOWN), Pin(12, Pin.IN, Pin.PULL_DOWN)]
+ROWS = [Pin(4, Pin.OUT), Pin(18, Pin.OUT), Pin(19, Pin.OUT), Pin(21, Pin.OUT)]
+COLS = [Pin(25, Pin.IN, Pin.PULL_DOWN), Pin(12, Pin.IN, Pin.PULL_DOWN), Pin(13, Pin.IN, Pin.PULL_DOWN)]
 KEYS = [
-    ["1","2","3"],
-    ["4","5","6"],
-    ["7","8","9"],
-    ["*","0","#"]
+    ["1", "2", "3"],
+    ["4", "5", "6"],
+    ["7", "8", "9"],
+    ["*", "0", "#"]
 ]
 
 # --- Timer ---
@@ -77,6 +78,7 @@ timer_restante = 0
 modo_timer = "idle"
 ultimo_tick = 0
 
+# --- Bip bip ---
 timer_bip_ativo = False
 bip_repeticoes = 0
 ultimo_pulso = 0
@@ -84,16 +86,61 @@ BIP_DURACAO = 700
 BIP_INTERVALO = 300
 PAUSA_PARES = 1000
 
+# --- MQTT Heartbeat/Reconeção ---
+last_io = 0  # ticks_ms do último tráfego (publish/ping)
+
+
+def mqtt_heartbeat():
+    global last_io, client
+    now = time.ticks_ms()
+    if time.ticks_diff(now, last_io) > 30000:
+        try:
+            client.ping()
+            last_io = now
+        except OSError:
+            reconnect_mqtt()
+
+
+def safe_publish(topic, payload, retain=False, qos=0):
+    global last_io, client
+    try:
+        client.publish(topic, payload, retain=retain, qos=qos)
+        last_io = time.ticks_ms()
+    except OSError:
+        reconnect_mqtt()
+        client.publish(topic, payload, retain=retain, qos=qos)
+        last_io = time.ticks_ms()
+
+
+def reconnect_mqtt():
+    global client, last_io
+    while True:
+        try:
+            client.connect(False)
+            client.subscribe(b"cozinha/alarme/gas")
+            client.subscribe(b"cozinha/alarme/fumaca")
+            client.subscribe(b"sala/ar")
+            client.subscribe(b"cozinha/alarme")
+            client.subscribe(b"banheiro/temperatura")
+            client.subscribe(b"banheiro/umidade")
+            last_io = time.ticks_ms()
+            break
+        except OSError:
+            time.sleep(2)
+
+
 # --- Funções Display ---
 def center_text(text, y):
-    x = (128 - len(text)*8)//2
+    x = (128 - len(text) * 8) // 2
     oled.text(text, x, y)
+
 
 def tela_inicial():
     oled.fill(0)
     center_text("TIMER COZINHA", 10)
     center_text("Press *", 35)
     oled.show()
+
 
 def tela_config(tempo_str="00:00"):
     oled.fill(0)
@@ -103,6 +150,7 @@ def tela_config(tempo_str="00:00"):
     oled.text("* apagar", 0, 50)
     oled.text("# ok", 90, 50)
     oled.show()
+
 
 def tela_timer():
     oled.fill(0)
@@ -117,6 +165,7 @@ def tela_timer():
     oled.fill_rect(4, 50, largura, 10, 1)
     oled.show()
 
+
 # --- Leitura Teclado ---
 def ler_tecla():
     for i, row in enumerate(ROWS):
@@ -128,12 +177,18 @@ def ler_tecla():
         row.value(0)
     return None
 
+
 # --- Timer Cozinha ---
 def timer_cozinha():
     global timer_total, timer_restante, modo_timer
     tempo_str = ""
-
     while True:
+        try:
+            client.check_msg()
+        except OSError:
+            reconnect_mqtt()
+        mqtt_heartbeat()
+
         digitos = ("0000" + tempo_str)[-4:]
         minutos = int(digitos[:-2])
         segundos = int(digitos[-2:])
@@ -147,7 +202,7 @@ def timer_cozinha():
                 tempo_str = tempo_str[:-1]
             elif tecla.isdigit() and len(tempo_str) < 4:
                 tempo_str += tecla
-        time.sleep(0.2)
+        time.sleep(0.1)
 
     digitos = ("0000" + tempo_str)[-4:]
     minutos = int(digitos[:-2])
@@ -156,14 +211,20 @@ def timer_cozinha():
     timer_restante = timer_total
     modo_timer = "rodando"
 
+
 # --- Wi-Fi ---
 def conectar_wifi():
     wlan = network.WLAN(network.STA_IF)
     wlan.active(True)
+    try:
+        wlan.config(pm=network.WLAN.PM_PERFORMANCE)
+    except Exception:
+        pass
     wlan.connect(SSID, PASSWORD)
     while not wlan.isconnected():
-        pass
+        time.sleep_ms(100)
     print("Wi-Fi conectado:", wlan.ifconfig())
+
 
 # --- LEDs ---
 def acender_led(nome):
@@ -171,14 +232,16 @@ def acender_led(nome):
     estado_leds[nome] = True
     manual_override[nome] = True
     if client:
-        client.publish(f"cozinha/alarme/{nome}/state", "ON")
+        safe_publish(f"cozinha/alarme/{nome}/state", "ON")
+
 
 def apagar_led(nome):
     leds[nome].value(0)
     estado_leds[nome] = False
     manual_override[nome] = False
     if client:
-        client.publish(f"cozinha/alarme/{nome}/state", "OFF")
+        safe_publish(f"cozinha/alarme/{nome}/state", "OFF")
+
 
 def desligar_tudo():
     global alarme_ativo
@@ -189,21 +252,27 @@ def desligar_tudo():
     buzzer.duty_u16(0)
     alarme_ativo = None
 
+
 # --- Atualiza alarme ---
 def atualizar_alarme():
-    global buzzer
+    global buzzer, rele_ventilador
     now = time.ticks_ms()
     if alarme_ativo == "gas":
         buzzer.freq(4000)
-        buzzer.duty_u16(30000)
+        buzzer.duty_u16(50000)
+        rele_ventilador.value(1)
     elif alarme_ativo == "fumaca":
         buzzer.freq(4000)
         if (now // 100) % 2 == 0:
-            buzzer.duty_u16(30000)
+            buzzer.duty_u16(50000)
         else:
             buzzer.duty_u16(0)
+        rele_ventilador.value(1)
     else:
         buzzer.duty_u16(0)
+        if override_ventilador is None:
+            rele_ventilador.value(0)
+
 
 # --- Monitorar MQ-2 ---
 def monitorar_mq2():
@@ -219,6 +288,7 @@ def monitorar_mq2():
         if alarme_ativo != "fumaca":
             alarme_ativo = "fumaca"
             alarme_start = now
+
     elif leitura >= limiarGas and not manual_override["gas"]:
         leds["gas"].value(1)
         estado_leds["gas"] = True
@@ -227,54 +297,57 @@ def monitorar_mq2():
         if alarme_ativo != "gas":
             alarme_ativo = "gas"
             alarme_start = now
+
     else:
         if not any(manual_override.values()):
-            if alarme_ativo and time.ticks_diff(now, alarme_start) > ALARME_MIN_MS:
-                desligar_tudo()
+            if alarme_ativo:
+                if time.ticks_diff(now, alarme_start) >= ALARME_MIN_MS:
+                    desligar_tudo()
+
 
 # --- MQTT ---
 def mqtt_callback(topic, msg):
     global override_ventilador, alarme_ativo
     topic = topic.decode()
     msg = msg.decode().upper()
-    
-    # Ventilador Sala de Jogos
-    if topic == "jogos/ar":
-        if msg in ["ON","0"]:
+
+    if topic == "sala/ar":
+        if msg in ["ON", "0"]:
             rele_ventilador.value(1)
             override_ventilador = True
-        elif msg in ["OFF","1"]:
+        elif msg in ["OFF", "1"]:
             rele_ventilador.value(0)
             override_ventilador = False
-    
-    # Alarme Gas / Fumaça
+
     elif topic == "cozinha/alarme/gas":
-        if msg in ["ON","1"]:
+        if msg in ["ON", "1"]:
             acender_led("gas")
             alarme_ativo = "gas"
-        elif msg in ["OFF","0"]:
+        elif msg in ["OFF", "0"]:
             apagar_led("gas")
             if alarme_ativo == "gas":
                 alarme_ativo = None
 
     elif topic == "cozinha/alarme/fumaca":
-        if msg in ["ON","1"]:
+        if msg in ["ON", "1"]:
             acender_led("fumaca")
             alarme_ativo = "fumaca"
-        elif msg in ["OFF","0"]:
+        elif msg in ["OFF", "0"]:
             apagar_led("fumaca")
             if alarme_ativo == "fumaca":
                 alarme_ativo = None
 
-# --- Bip do timer ---
+
+# --- Bip bip do timer ---
 def atualizar_buzzer_timer():
     global timer_bip_ativo, bip_repeticoes, ultimo_pulso, modo_timer
+
     if modo_timer == "fim":
         if not timer_bip_ativo:
             timer_bip_ativo = True
             bip_repeticoes = 0
             ultimo_pulso = time.ticks_ms()
-            buzzer_timer.duty_u16(30000)
+            buzzer_timer.duty_u16(2000)
         else:
             now = time.ticks_ms()
             if bip_repeticoes < 6:
@@ -285,8 +358,8 @@ def atualizar_buzzer_timer():
                     else:
                         if bip_repeticoes % 2 == 0 and bip_repeticoes != 0:
                             time.sleep_ms(PAUSA_PARES)
-                        buzzer_timer.duty_u16(30000)
-                    bip_repeticoes += 1
+                        buzzer_timer.duty_u16(2000)
+                        bip_repeticoes += 1
                     ultimo_pulso = now
             else:
                 buzzer_timer.duty_u16(0)
@@ -296,71 +369,86 @@ def atualizar_buzzer_timer():
         buzzer_timer.duty_u16(0)
         timer_bip_ativo = False
 
+
 # --- Main ---
 def main():
-    global client, timer_restante, modo_timer, ultimo_tick, override_ventilador
-    last_dht_read = 0
-    last_dht11_read = 0
-    last_mq2_read = 0
+    global client, timer_restante, modo_timer, ultimo_tick, override_ventilador, last_io
 
     conectar_wifi()
+
     client = MQTTClient(
         CLIENT_ID,
         MQTT_BROKER,
         port=MQTT_PORT,
         user=MQTT_USER,
         password=MQTT_PASS,
+        keepalive=60,
         ssl=True,
         ssl_params={"server_hostname": MQTT_BROKER}
     )
+
     client.set_callback(mqtt_callback)
+    client.timeout = 10
     client.connect()
+
     client.subscribe(b"cozinha/alarme/gas")
     client.subscribe(b"cozinha/alarme/fumaca")
-    client.subscribe(b"jogos/ar")
+    client.subscribe(b"sala/ar")
     client.subscribe(b"cozinha/alarme")
     client.subscribe(b"banheiro/temperatura")
     client.subscribe(b"banheiro/umidade")
 
+    last_io = time.ticks_ms()
+    last_dht_read = time.time()
+    last_dht11_read = time.time()
+    last_mq2_read = time.time()
+
     while True:
-        client.check_msg()
+        try:
+            client.check_msg()
+        except OSError:
+            reconnect_mqtt()
+
+        mqtt_heartbeat()
         monitorar_mq2()
-        
+
+        # DHT11
         if time.time() - last_dht11_read >= 5:
             try:
                 dht11.measure()
                 temperatura = dht11.temperature()
-                client.publish("banheiro/temperatura", str(temperatura))  
+                safe_publish("banheiro/temperatura", str(temperatura))
                 umidade = dht11.humidity()
-                client.publish("banheiro/umidade", str(umidade))  
-                
-            except:
+                safe_publish("banheiro/umidade", str(umidade))
+            except Exception:
                 pass
             last_dht11_read = time.time()
 
+        # DHT22
         if time.time() - last_dht_read >= 5:
             try:
                 dht22.measure()
                 temperatura = dht22.temperature()
-                client.publish("jogos/temperatura", str(temperatura)) 
-
-
+                safe_publish("sala/temperatura", str(temperatura))
                 if override_ventilador is None:
                     if temperatura >= 28:
                         rele_ventilador.value(1)
                     else:
                         rele_ventilador.value(0)
-            except:
+            except Exception:
                 pass
             last_dht_read = time.time()
 
+        # Timer
         if modo_timer == "idle":
             tela_inicial()
             tecla = ler_tecla()
             if tecla == "*":
                 modo_timer = "config"
+
         elif modo_timer == "config":
             timer_cozinha()
+
         elif modo_timer == "rodando":
             if time.time() - ultimo_tick >= 1:
                 ultimo_tick = time.time()
@@ -368,22 +456,22 @@ def main():
                 if timer_restante <= 0:
                     modo_timer = "fim"
             tela_timer()
+
         elif modo_timer == "fim":
             tela_timer()
-        
-        
+
+        # MQ-2 leitura
         if time.time() - last_mq2_read >= 2:
             try:
-                valor = mq2.read() 
-                client.publish("cozinha/alarme", str(valor))
+                valor = mq2.read()
+                safe_publish("cozinha/alarme", str(valor))
             except Exception as e:
                 print("Erro MQ2:", e)
             last_mq2_read = time.time()
-                
+
         atualizar_alarme()
         atualizar_buzzer_timer()
-        
-        
+
 
 if __name__ == "__main__":
     main()
