@@ -15,15 +15,15 @@ buzzer = PWM(Pin(14))
 buzzer.duty_u16(0)
 
 # --- Config Wi-Fi ---
-SSID = "batcaverna"
-PASSWORD = "eusouobatman"
+SSID = "xx"
+PASSWORD = "xx"
 
 # --- Config MQTT HiveMQ Cloud ---
-MQTT_BROKER = "76a060ba0e5e4996b1e10d38c3bfde9b.s1.eu.hivemq.cloud"
+MQTT_BROKER = "x.s1.eu.hivemq.cloud"
 MQTT_PORT = 8883
 CLIENT_ID = "smart_home_1"
-MQTT_USER = "speedy"
-MQTT_PASS = "Master123"
+MQTT_USER = "xx"
+MQTT_PASS = "xxx"
 
 # --- Config do relé ---
 rele_ventilador = Pin(5, Pin.OUT)
